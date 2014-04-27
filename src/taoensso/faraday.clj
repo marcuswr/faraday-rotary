@@ -181,7 +181,7 @@
     (BigDecimal. s)
     (bigint (BigInteger. s))))
 
-(defn- db-val->clj-val "Returns the Clojure value of given AttributeValue object."
+(defn default-deserializer "Returns the Clojure value of given AttributeValue object."
   [^AttributeValue x]
   (or (.getS x)
       (some->> (.getN  x) ddb-num-str->num)
@@ -190,7 +190,35 @@
       (some->> (.getNS x) (mapv ddb-num-str->num) (into #{}))
       (some->> (.getBS x) (mapv nt-thaw)          (into #{}))))
 
-(defn- clj-val->db-val "Returns an AttributeValue object for given Clojure value."
+(defn rotary-deserializer "Returns the Clojure value of given
+AttributeValue object as persisted by rotary."
+  [^AttributeValue x]
+  (or (.getS x)
+      (some->> (.getN  x) Long.)
+      (some->> (.getB  x) .array)
+      (some->> (.getSS x) (into #{}))
+      (some->> (.getNS x) (mapv (fn [^String s] (Long. s))) (into #{}))
+      (some->> (.getBS x) (mapv (fn [^java.nio.ByteBuffer b] (.array b))) (into #{}))
+      ))
+
+(defn- set-of [f s]
+  (and (set? s) (every? f s)))
+
+(defn rotary-serializer
+  "Convert a value into an AttributeValue object."
+  ^AttributeValue [x]
+  (cond
+   (string? x) (doto (AttributeValue.) (.setS x))
+   (number? x) (doto (AttributeValue.) (.setN (str x)))
+   (set-of string? x) (doto (AttributeValue.) (.setSS x))
+   (set-of number? x) (doto (AttributeValue.) (.setNS (map str x)))
+   (set? x) (throw (Exception. "Set must be all numbers or all strings"))
+   :else (doto (AttributeValue.) (.setB (java.nio.ByteBuffer/wrap x)))
+;      :else (throw (Exception. (str "Unknown value type: " (type
+;      x))))
+   ))
+
+(defn default-serializer "Returns an AttributeValue object for given Clojure value."
   ^AttributeValue [x]
   (cond
    (stringy? x)
@@ -214,7 +242,9 @@
 
    (instance? AttributeValue x) x
    :else (throw (Exception. (str "Unknown DynamoDB value type: " (type x) "."
-                                 " See `freeze` for serialization.")))))
+                                 " See `freeze` for serialization." x)))))
+
+
 
 (comment
   (mapv clj-val->db-val [  "a"    1 3.14    (.getBytes "a")    (freeze :a)
@@ -222,113 +252,114 @@
 
 ;;;; Coercion - objects
 
-(def db-item->clj-item (partial utils/keyword-map db-val->clj-val))
-(def clj-item->db-item (partial utils/name-map    clj-val->db-val))
+(defn- db-item->clj-item [deserializer] (partial utils/keyword-map deserializer))
+(defn- clj-item->db-item [serializer] (partial utils/name-map serializer))
 
 (defn- cc-units [^ConsumedCapacity cc] (some-> cc (.getCapacityUnits)))
 
-(defprotocol AsMap (as-map [x]))
+(defprotocol AsMap (as-map [x deserializer]))
 
-(defmacro ^:private am-item-result [result get-form]
+(defmacro ^:private am-item-result [result deserializer get-form]
   `(when-let [get-form# ~get-form]
-     (with-meta (db-item->clj-item get-form#)
+     (with-meta ((db-item->clj-item ~deserializer) get-form#)
        {:cc-units (cc-units (.getConsumedCapacity ~result))})))
 
-(defmacro ^:private am-query|scan-result [result & [meta]]
-  `(let [result# ~result]
-     (merge {:items (mapv db-item->clj-item (.getItems result#))
+(defmacro ^:private am-query|scan-result [result deserializer & [meta]]
+  `(let [result# ~result
+         deserializer# ~deserializer]
+     (merge {:items (mapv (db-item->clj-item deserializer#) (.getItems result#))
              :count (.getCount result#)
              :cc-units (cc-units (.getConsumedCapacity result#))
-             :last-prim-kvs (as-map (.getLastEvaluatedKey result#))}
+             :last-prim-kvs (as-map (.getLastEvaluatedKey result#) deserializer#)}
             ~meta)))
 
 (extend-protocol AsMap
-  nil                 (as-map [_] nil)
-  java.util.ArrayList (as-map [a] (mapv as-map a))
-  java.util.HashMap   (as-map [m] (utils/keyword-map as-map m))
+  nil                 (as-map [_ deserializer] nil)
+  java.util.ArrayList (as-map [a deserializer] (mapv #(as-map % deserializer) a))
+  java.util.HashMap   (as-map [m deserializer] (utils/keyword-map #(as-map % deserializer) m))
 
-  AttributeValue      (as-map [v] (db-val->clj-val v))
-  AttributeDefinition (as-map [d] {:name (keyword       (.getAttributeName d))
-                                   :type (utils/un-enum (.getAttributeType d))})
-  KeySchemaElement    (as-map [e] {:name (keyword (.getAttributeName e))
-                                   :type (utils/un-enum (.getKeyType e))})
+  AttributeValue      (as-map [v deserializer] (deserializer v))
+  AttributeDefinition (as-map [d deserializer] {:name (keyword       (.getAttributeName d))
+                                        :type (utils/un-enum (.getAttributeType d))})
+  KeySchemaElement    (as-map [e deserializer] {:name (keyword (.getAttributeName e))
+                                        :type (utils/un-enum (.getKeyType e))})
   KeysAndAttributes
-  (as-map [x]
+  (as-map [x deserializer]
     (merge
      (when-let [a (.getAttributesToGet x)] {:attrs (mapv keyword a)})
      (when-let [c (.getConsistentRead  x)] {:consistent? c})
-     (when-let [k (.getKeys            x)] {:keys (mapv db-item->clj-item k)})))
+     (when-let [k (.getKeys            x)] {:keys (mapv (db-item->clj-item deserializer) k)})))
 
-  GetItemResult       (as-map [r] (am-item-result r (.getItem r)))
-  PutItemResult       (as-map [r] (am-item-result r (.getAttributes r)))
-  UpdateItemResult    (as-map [r] (am-item-result r (.getAttributes r)))
-  DeleteItemResult    (as-map [r] (am-item-result r (.getAttributes r)))
+  GetItemResult       (as-map [r deserializer] (am-item-result r deserializer (.getItem r)))
+  PutItemResult       (as-map [r deserializer] (am-item-result r deserializer (.getAttributes r)))
+  UpdateItemResult    (as-map [r deserializer] (am-item-result r deserializer (.getAttributes r)))
+  DeleteItemResult    (as-map [r deserializer] (am-item-result r deserializer (.getAttributes r)))
 
-  QueryResult         (as-map [r] (am-query|scan-result r))
-  ScanResult          (as-map [r] (am-query|scan-result r
-                                    {:scanned-count (.getScannedCount r)}))
+  QueryResult         (as-map [r deserializer] (am-query|scan-result r deserializer))
+  ScanResult          (as-map [r deserializer] (am-query|scan-result r deserializer
+                                                             {:scanned-count (.getScannedCount r)}))
 
   BatchGetItemResult
-  (as-map [r]
-    {:items       (utils/keyword-map as-map (.getResponses r))
+  (as-map [r deserializer]
+    {:items       (utils/keyword-map #(as-map % deserializer) (.getResponses r))
      :unprocessed (.getUnprocessedKeys r)
      :cc-units    (cc-units (.getConsumedCapacity r))})
 
   BatchWriteItemResult
-  (as-map [r]
+  (as-map [r deserializer]
     {:unprocessed (.getUnprocessedItems r)
      :cc-units    (cc-units (.getConsumedCapacity r))})
 
   TableDescription
-  (as-map [d]
+  (as-map [d deserializer]
     {:name          (keyword (.getTableName d))
      :creation-date (.getCreationDateTime d)
      :item-count    (.getItemCount d)
      :size          (.getTableSizeBytes d)
-     :throughput    (as-map (.getProvisionedThroughput  d))
-     :indexes       (as-map (.getLocalSecondaryIndexes  d)) ; DEPRECATED
-     :lsindexes     (as-map (.getLocalSecondaryIndexes  d))
-     :gsindexes     (as-map (.getGlobalSecondaryIndexes d))
+     :throughput    (as-map (.getProvisionedThroughput  d) deserializer)
+     :indexes       (as-map (.getLocalSecondaryIndexes  d) deserializer) ; DEPRECATED
+     :lsindexes     (as-map (.getLocalSecondaryIndexes  d) deserializer)
+     :gsindexes     (as-map (.getGlobalSecondaryIndexes d) deserializer)
      :status        (utils/un-enum (.getTableStatus d))
      :prim-keys
-     (let [schema (as-map (.getKeySchema d))
-           defs   (as-map (.getAttributeDefinitions d))]
+     (let [schema (as-map (.getKeySchema d) deserializer)
+           defs   (as-map (.getAttributeDefinitions d) deserializer)]
        (merge-with merge
          (reduce-kv (fn [m k v] (assoc m (:name v) {:key-type  (:type v)}))
                     {} schema)
          (reduce-kv (fn [m k v] (assoc m (:name v) {:data-type (:type v)}))
                     {} defs)))})
 
-  DescribeTableResult (as-map [r] (as-map (.getTable r)))
-  CreateTableResult   (as-map [r] (as-map (.getTableDescription r)))
-  UpdateTableResult   (as-map [r] (as-map (.getTableDescription r)))
-  DeleteTableResult   (as-map [r] (as-map (.getTableDescription r)))
+  DescribeTableResult (as-map [r deserializer] (as-map (.getTable r) deserializer))
+  CreateTableResult   (as-map [r deserializer] (as-map (.getTableDescription r) deserializer))
+  UpdateTableResult   (as-map [r deserializer] (as-map (.getTableDescription r) deserializer))
+  DeleteTableResult   (as-map [r deserializer] (as-map (.getTableDescription r) deserializer))
 
   Projection
-  (as-map [p] {:projection-type    (.getProjectionType p)
-               :non-key-attributes (.getNonKeyAttributes p)})
+  (as-map [p deserializer] {:projection-type    (.getProjectionType p)
+                    :non-key-attributes (.getNonKeyAttributes p)})
 
   LocalSecondaryIndexDescription
-  (as-map [d] {:name       (keyword (.getIndexName d))
-               :size       (.getIndexSizeBytes d)
-               :item-count (.getItemCount d)
-               :key-schema (as-map (.getKeySchema d))
-               :projection (as-map (.getProjection d))})
+  (as-map [d deserializer] {:name       (keyword (.getIndexName d))
+                    :size       (.getIndexSizeBytes d)
+                    :item-count (.getItemCount d)
+                    :key-schema (as-map (.getKeySchema d) deserializer)
+                    :projection (as-map (.getProjection d) deserializer)})
 
   GlobalSecondaryIndexDescription
-  (as-map [d] {:name       (keyword (.getIndexName d))
-               :size       (.getIndexSizeBytes d)
-               :item-count (.getItemCount d)
-               :key-schema (as-map (.getKeySchema d))
-               :projection (as-map (.getProjection d))
-               :throughput (as-map (.getProvisionedThroughput d))})
+  (as-map [d deserializer] {:name       (keyword (.getIndexName d))
+                    :size       (.getIndexSizeBytes d)
+                    :item-count (.getItemCount d)
+                    :key-schema (as-map (.getKeySchema d) deserializer)
+                    :projection (as-map (.getProjection d) deserializer)
+                    :throughput (as-map (.getProvisionedThroughput d) deserializer)})
 
   ProvisionedThroughputDescription
-  (as-map [d] {:read                (.getReadCapacityUnits d)
-               :write               (.getWriteCapacityUnits d)
-               :last-decrease       (.getLastDecreaseDateTime d)
-               :last-increase       (.getLastIncreaseDateTime d)
-               :num-decreases-today (.getNumberOfDecreasesToday d)}))
+  (as-map [d deserializer] {:read                (.getReadCapacityUnits d)
+                    :write               (.getWriteCapacityUnits d)
+                    :last-decrease       (.getLastDecreaseDateTime d)
+                    :last-increase       (.getLastIncreaseDateTime d)
+                    :num-decreases-today (.getNumberOfDecreasesToday d)}))
 
 ;;;; API - tables
 
@@ -340,7 +371,7 @@
   "Returns a map describing a table, or nil if the table doesn't exist."
   [client-opts table]
   (try (as-map (.describeTable (db-client client-opts)
-                (doto (DescribeTableRequest.) (.setTableName (name table)))))
+                (doto (DescribeTableRequest.) (.setTableName (name table)))) nil)
        (catch ResourceNotFoundException _ nil)))
 
 (defn table-status-watch
@@ -480,7 +511,7 @@
              lsindexes (.setLocalSecondaryIndexes
                         (local-2nd-indexes hash-keydef lsindexes))
              gsindexes (.setGlobalSecondaryIndexes
-                        (global-2nd-indexes gsindexes)))))]
+                        (global-2nd-indexes gsindexes)))) nil)]
     (if-not block? result @(table-status-watch client-opts table-name :creating))))
 
 (comment (time (create-table mc "delete-me7" [:id :s] {:block? true})))
@@ -538,7 +569,7 @@
                        (doto (UpdateTableRequest.)
                          (.setTableName (name table))
                          (.setProvisionedThroughput (provisioned-throughput
-                                                     {:read r' :write w'})))))
+                                                     {:read r' :write w'})))) nil)
                     ;; Returns _new_ descr when ready:
                     @(table-status-watch client-opts table :updating))]
 
@@ -553,7 +584,7 @@
 
 (defn delete-table "Deletes a table, go figure."
   [client-opts table]
-  (as-map (.deleteTable (db-client client-opts) (DeleteTableRequest. (name table)))))
+  (as-map (.deleteTable (db-client client-opts) (DeleteTableRequest. (name table))) nil))
 
 ;;;; API - items
 
@@ -567,19 +598,20 @@
    (.getItem (db-client client-opts)
     (doto-cond [g (GetItemRequest.)]
       :always     (.setTableName       (name table))
-      :always     (.setKey             (clj-item->db-item prim-kvs))
+      :always     (.setKey             ((clj-item->db-item (or (:serializer client-opts) default-serializer)) prim-kvs))
       consistent? (.setConsistentRead  g)
       attrs       (.setAttributesToGet (mapv name g))
-      return-cc?  (.setReturnConsumedCapacity (utils/enum :total))))))
+      return-cc?  (.setReturnConsumedCapacity (utils/enum :total))))
+   (or (:deserializer client-opts) default-deserializer)))
 
 (defn- expected-values
   "{<attr> <cond> ...} -> {<attr> ExpectedAttributeValue ...}"
-  [expected-map]
+  [expected-map serializer]
   (when (seq expected-map)
     (utils/name-map
      #(if (= false %)
         (ExpectedAttributeValue. false)
-        (ExpectedAttributeValue. (clj-val->db-val %)))
+        (ExpectedAttributeValue. (serializer %)))
      expected-map)))
 
 (defn put-item
@@ -595,17 +627,18 @@
    (.putItem (db-client client-opts)
      (doto-cond [g (PutItemRequest.)]
        :always  (.setTableName    (name table))
-       :always  (.setItem         (clj-item->db-item item))
-       expected (.setExpected     (expected-values g))
+       :always  (.setItem         ((clj-item->db-item (or (:serializer client-opts) default-serializer)) item))
+       expected (.setExpected     (expected-values g (or (:serializer client-opts) default-serializer)))
        return   (.setReturnValues (utils/enum g))
-       return-cc? (.setReturnConsumedCapacity (utils/enum :total))))))
+       return-cc? (.setReturnConsumedCapacity (utils/enum :total))))
+   (or (:deserializer client-opts) default-deserializer)))
 
 (defn- attribute-updates
   "{<attr> [<action> <value>] ...} -> {<attr> AttributeValueUpdate ...}"
-  [update-map]
+  [update-map serializer]
   (when (seq update-map)
     (utils/name-map
-     (fn [[action val]] (AttributeValueUpdate. (when val (clj-val->db-val val))
+     (fn [[action val]] (AttributeValueUpdate. (when val (serializer val))
                                               (utils/enum action)))
      update-map)))
 
@@ -621,11 +654,12 @@
    (.updateItem (db-client client-opts)
      (doto-cond [g (UpdateItemRequest.)]
        :always  (.setTableName        (name table))
-       :always  (.setKey              (clj-item->db-item prim-kvs))
-       :always  (.setAttributeUpdates (attribute-updates update-map))
-       expected (.setExpected         (expected-values g))
+       :always  (.setKey              ((clj-item->db-item (or (:serializer client-opts) default-serializer)) prim-kvs))
+       :always  (.setAttributeUpdates (attribute-updates update-map (or (:serializer client-opts) default-serializer)))
+       expected (.setExpected         (expected-values g (or (:serializer client-opts) default-serializer)))
        return   (.setReturnValues     (utils/enum g))
-       return-cc? (.setReturnConsumedCapacity (utils/enum :total))))))
+       return-cc? (.setReturnConsumedCapacity (utils/enum :total))))
+   (or (:deserializer client-opts) default-deserializer)))
 
 (defn delete-item
   "Deletes an item from a table by its primary key.
@@ -636,16 +670,17 @@
    (.deleteItem (db-client client-opts)
      (doto-cond [g (DeleteItemRequest.)]
        :always  (.setTableName    (name table))
-       :always  (.setKey          (clj-item->db-item prim-kvs))
-       expected (.setExpected     (expected-values g))
+       :always  (.setKey          ((clj-item->db-item (or (:serializer client-opts) default-serializer)) prim-kvs))
+       expected (.setExpected     (expected-values g (or (:serializer client-opts) default-serializer)))
        return   (.setReturnValues (utils/enum g))
-       return-cc? (.setReturnConsumedCapacity (utils/enum :total))))))
+       return-cc? (.setReturnConsumedCapacity (utils/enum :total))))
+   nil))
 
 ;;;; API - batch ops
 
 (defn- attr-multi-vs
   "[{<attr> <v-or-vs*> ...} ...]* -> [{<attr> <v> ...} ...] (* => optional vec)"
-  [attr-multi-vs-map]
+  [attr-multi-vs-map serializer]
   (let [ensure-coll (fn [x] (if (coll?* x) x [x]))]
     (reduce (fn [r attr-multi-vs]
               (let [attrs (keys attr-multi-vs)
@@ -653,7 +688,7 @@
                 (when (> (count (filter next vs)) 1)
                   (-> (Exception. "Can range over only a single attr's values")
                       (throw)))
-                (into r (mapv (comp clj-item->db-item (partial zipmap attrs))
+                (into r (mapv (comp (clj-item->db-item serializer) (partial zipmap attrs))
                               (apply utils/cartesian-product vs)))))
             [] (ensure-coll attr-multi-vs-map))))
 
@@ -662,13 +697,13 @@
 
 (defn- batch-request-items
   "{<table> <request> ...} -> {<table> KeysAndAttributes> ...}"
-  [requests]
+  [requests serializer]
   (utils/name-map
    (fn [{:keys [prim-kvs attrs consistent?]}]
      (doto-cond [g (KeysAndAttributes.)]
        attrs       (.setAttributesToGet (mapv name g))
        consistent? (.setConsistentRead  g)
-       :always     (.setKeys (attr-multi-vs prim-kvs))))
+       :always     (.setKeys (attr-multi-vs prim-kvs serializer))))
    requests))
 
 (comment (batch-request-items {:my-table {:prim-kvs [{:my-hash  ["a" "b"]
@@ -713,8 +748,9 @@
              (.batchGetItem (db-client client-opts)
                (doto-cond [g (BatchGetItemRequest.)] ; {table-str KeysAndAttributes}
                  :always    (.setRequestItems raw-req)
-                 return-cc? (.setReturnConsumedCapacity (utils/enum :total))))))]
-    (merge-more run1 span-reqs (run1 (batch-request-items requests)))))
+                 return-cc? (.setReturnConsumedCapacity (utils/enum :total))))
+             (or (:deserializer client-opts) default-deserializer)))]
+    (merge-more run1 span-reqs (run1 (batch-request-items requests (or (:serializer client-opts) default-serializer))))))
 
 (comment
   (def bigval (.getBytes (apply str (range 14000))))
@@ -737,7 +773,6 @@
      {:users {:put    [{:user-id 1 :username \"sally\"}
                        {:user-id 2 :username \"jane\"}]
               :delete [{:user-id [3 4 5]}]}})
-
   :span-reqs - {:max _ :throttle-ms _} allows a number of requests to
   automatically be stitched together (to exceed throughput limits, for example)."
   [client-opts requests & [{:keys [return-cc? span-reqs] :as opts
@@ -747,7 +782,8 @@
              (.batchWriteItem (db-client client-opts)
                (doto-cond [g (BatchWriteItemRequest.)]
                  :always    (.setRequestItems raw-req)
-                 return-cc? (.setReturnConsumedCapacity (utils/enum :total))))))]
+                 return-cc? (.setReturnConsumedCapacity (utils/enum :total))))
+             (or (:deserializer client-opts) default-deserializer)))]
     (merge-more run1 span-reqs
       (run1
        (utils/name-map
@@ -755,7 +791,7 @@
         (fn [table-request]
           (reduce into []
             (for [action (keys table-request)
-                  :let [items (attr-multi-vs (table-request action))]]
+                  :let [items (attr-multi-vs (table-request action) (or (:serializer client-opts) default-serializer))]]
               (mapv (partial write-request action) items))))
         requests)))))
 
@@ -767,7 +803,7 @@
 
 (defn- query|scan-conditions
   "{<attr> [operator <val-or-vals>] ...} -> {<attr> Condition ...}"
-  [conditions]
+  [conditions serializer]
   (when (seq conditions)
     (utils/name-map
      (fn [[operator val-or-vals & more :as condition]]
@@ -775,7 +811,7 @@
        (let [vals (if (coll?* val-or-vals) val-or-vals [val-or-vals])]
          (doto (Condition.)
            (.setComparisonOperator (enum-op operator))
-           (.setAttributeValueList (mapv clj-val->db-val vals)))))
+           (.setAttributeValueList (mapv serializer vals)))))
      conditions)))
 
 (defn query
@@ -816,17 +852,18 @@
              (.query (db-client client-opts)
                (doto-cond [g (QueryRequest.)]
                  :always (.setTableName        (name table))
-                 :always (.setKeyConditions    (query|scan-conditions prim-key-conds))
+                 :always (.setKeyConditions    (query|scan-conditions prim-key-conds (or (:serializer client-opts) default-serializer)))
                  :always (.setScanIndexForward (case order :asc true :desc false))
                  last-prim-kvs   (.setExclusiveStartKey
-                                  (clj-item->db-item last-prim-kvs))
+                                  ((clj-item->db-item (or (:serializer client-opts) default-serializer)) last-prim-kvs))
                  limit           (.setLimit     (int g))
                  index           (.setIndexName      g)
                  consistent?     (.setConsistentRead g)
                  (coll?* return) (.setAttributesToGet (mapv name return))
                  return-cc? (.setReturnConsumedCapacity (utils/enum :total))
                  (and return (not (coll?* return)))
-                 (.setSelect (utils/enum return))))))]
+                 (.setSelect (utils/enum return))))
+             (or (:deserializer client-opts) default-deserializer)))]
     (merge-more run1 span-reqs (run1 last-prim-kvs))))
 
 (defn scan
@@ -866,16 +903,17 @@
              (.scan (db-client client-opts)
                (doto-cond [g (ScanRequest.)]
                  :always (.setTableName (name table))
-                 attr-conds      (.setScanFilter        (query|scan-conditions g))
+                 attr-conds      (.setScanFilter        (query|scan-conditions g (or (:serializer client-opts) default-serializer)))
                  last-prim-kvs   (.setExclusiveStartKey
-                                  (clj-item->db-item last-prim-kvs))
+                                  ((clj-item->db-item (or (:serializer client-opts) default-serializer)) last-prim-kvs))
                  limit           (.setLimit             (int g))
                  total-segments  (.setTotalSegments     (int g))
                  segment         (.setSegment           (int g))
                  (coll?* return) (.setAttributesToGet (mapv name return))
                  return-cc? (.setReturnConsumedCapacity (utils/enum :total))
                  (and return (not (coll?* return)))
-                 (.setSelect (utils/enum return))))))]
+                 (.setSelect (utils/enum return))))
+             (or (:deserializer client-opts) default-deserializer)))]
     (merge-more run1 span-reqs (run1 last-prim-kvs))))
 
 (defn scan-parallel
